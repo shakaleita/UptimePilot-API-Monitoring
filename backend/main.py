@@ -1,7 +1,7 @@
 APP_TITLE = 'UptimePilot'
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 import sqlite3, os
 from contextlib import contextmanager
@@ -43,19 +43,47 @@ setup("""CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY,name TEXT NO
 class Monitor(BaseModel):
     name:str
     url:str
-    expected_status:int=200
+    expected_status:int=Field(default=200,ge=100,le=599)
 
-def valid_public_url(url):
-    p=urlparse(url)
-    if p.scheme not in ('http','https') or not p.hostname or p.username or p.password or p.fragment:
-        raise HTTPException(422,'Use a public HTTP(S) URL')
+def valid_public_url(url: str, *, require_allowlist: bool = False):
+    """Reject unapproved outbound URLs and non-global DNS results.
+
+    An exact hostname allowlist is required for outgoing checks. Operations
+    should also restrict network egress against DNS rebinding.
+    """
+    from urllib.parse import urlsplit
+    if not isinstance(url, str) or len(url) > 2048 or any(ord(ch) < 32 for ch in url):
+        raise HTTPException(422, 'Invalid monitoring URL')
     try:
-        if p.port not in (None,80,443):raise HTTPException(422,'Only standard HTTP(S) ports are allowed')
-    except ValueError:raise HTTPException(422,'Invalid URL port')
+        p = urlsplit(url)
+        host = (p.hostname or '').rstrip('.').lower()
+        port = p.port
+    except ValueError:
+        raise HTTPException(422, 'Invalid monitoring URL')
+    if (p.scheme not in ('http', 'https') or not host or not p.netloc
+            or p.username is not None or p.password is not None
+            or p.fragment or port not in (None, 80, 443)):
+        raise HTTPException(422, 'Use a public HTTP(S) URL on a standard port')
+    if host in ('localhost', 'localhost.localdomain') or host.endswith('.localhost'):
+        raise HTTPException(422, 'Local hosts are not allowed')
     try:
-        infos=socket.getaddrinfo(p.hostname,None)
-        if not infos or any(not ipaddress.ip_address(info[4][0]).is_global for info in infos):raise HTTPException(422,'Private/network-local hosts are not allowed')
-    except socket.gaierror:raise HTTPException(422,'Cannot resolve hostname')
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise HTTPException(422, 'IP literal targets are not allowed')
+    if require_allowlist:
+        allowed = {h.strip().rstrip('.').lower() for h in os.getenv('ALLOWED_MONITOR_HOSTS', '').split(',') if h.strip()}
+        if not allowed or host not in allowed:
+            raise HTTPException(403, 'Target host is not in ALLOWED_MONITOR_HOSTS')
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        raise HTTPException(422, 'Cannot resolve monitoring hostname')
+    if not infos or any(not ipaddress.ip_address(info[4][0]).is_global for info in infos):
+        raise HTTPException(422, 'Private, reserved or local addresses are not allowed')
+    return host
+
 @app.get('/api/items')
 def items():
     with db() as c:return rows(c.execute('SELECT * FROM monitors ORDER BY id DESC'))

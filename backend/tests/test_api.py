@@ -48,3 +48,15 @@ def test_v05_authentication():
     with TestClient(app) as anonymous:
         assert anonymous.get('/api/items').status_code==401
         assert anonymous.post('/api/auth/register',json={'username':'intruder','password':'DemoPassword123!','setup_token':'bad'}).status_code==403
+
+# v0.6 request-origin and owner audit regression
+def test_v06_audit_record_and_cross_site_guard():
+    attempted=client.post('/api/__audit_probe_404')
+    assert attempted.status_code==404
+    audit=client.get('/api/auth/audit')
+    assert audit.status_code==200
+    assert any(row['method']=='POST' and row['path']=='/api/__audit_probe_404'
+               and row['status_code']==404 for row in audit.json())
+    assert client.get('/api/auth/audit',params={'limit':201}).status_code==422
+    blocked=client.post('/api/__audit_probe_404',headers={'sec-fetch-site':'cross-site'})
+    assert blocked.status_code==403

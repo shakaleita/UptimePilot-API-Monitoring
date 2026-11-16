@@ -45,3 +45,20 @@ def test_password_change_requires_authentication(tmp_path,monkeypatch):
         response=guest.post("/api/auth/change-password",json={
             "current_password":"OldDemoPass123!","new_password":"NewStrongPassword123!"})
         assert response.status_code==401
+
+
+def test_production_session_cookies_require_https_even_with_local_override(tmp_path,monkeypatch):
+    monkeypatch.setenv("OWNER_SETUP_TOKEN","unit-test-only-setup-token-123456789012")
+    monkeypatch.setenv("APP_ENV","production")
+    monkeypatch.setenv("COOKIE_SECURE","0")
+    app=FastAPI()
+    install_auth(app,tmp_path/"isolated-production-auth.db")
+    with TestClient(app,base_url="https://testserver") as browser:
+        owner={"username":"productionowner","password":"SecurePassword123!"}
+        assert browser.post("/api/auth/register",json={**owner,
+            "setup_token":"unit-test-only-setup-token-123456789012"}).status_code==201
+        logged=browser.post("/api/auth/login",json=owner)
+        assert logged.status_code==200
+        cookie=logged.headers.get("set-cookie","").lower()
+        assert "secure" in cookie and "httponly" in cookie and "samesite=strict" in cookie
+        assert browser.get("/api/auth/me").status_code==200

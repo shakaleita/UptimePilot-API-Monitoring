@@ -9,7 +9,7 @@ from pathlib import Path
 
 DB = Path(os.environ.get("APP_DB", str(Path(__file__).parent / "app.db")))
 app = FastAPI(title=APP_TITLE, version="0.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","), allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @contextmanager
 def db():

@@ -97,3 +97,57 @@ def test_monitor_rejects_private_resolution(monkeypatch):
     with pytest.raises(HTTPException) as error:
         valid_public_url('https://example.com', require_allowlist=True)
     assert error.value.status_code == 422
+
+
+def test_monitor_connects_only_to_validated_public_ip(monkeypatch):
+    import asyncio,socket
+    from main import db
+    from main import status_from_pinned_address
+    monkeypatch.setenv('ALLOWED_MONITOR_HOSTS','example.com')
+    monkeypatch.setattr(socket,'getaddrinfo',
+        lambda *args,**kwargs:[(socket.AF_INET,socket.SOCK_STREAM,6,'',('93.184.215.14',0))])
+    observed=[]
+    class Writer:
+        def write(self, data): observed.append(data)
+        async def drain(self): pass
+        def close(self): pass
+        async def wait_closed(self): pass
+    async def open_pinned(**options):
+        observed.append(options)
+        reader=asyncio.StreamReader()
+        reader.feed_data(b'HTTP/1.1 204 No Content\r\n')
+        reader.feed_eof()
+        return reader,Writer()
+    monkeypatch.setattr(asyncio,'open_connection',open_pinned)
+    with db() as con:
+        monitor_id=con.execute('INSERT INTO monitors(name,url,expected_status) VALUES(?,?,?)',
+                               ('Pinned QA','https://example.com/health?full=1',204)).lastrowid
+    response=client.post(f'/api/check/{monitor_id}')
+    assert response.status_code==200
+    assert response.json()['status']==204
+    assert response.json()['ok'] is True
+    assert observed[0]['host']=='93.184.215.14'
+    assert observed[0]['server_hostname']=='example.com'
+    assert b'Host: example.com' in observed[1]
+    assert b'GET /health?full=1 HTTP/1.1' in observed[1]
+
+
+def test_status_probe_does_not_follow_redirects(monkeypatch):
+    import asyncio
+    from main import status_from_pinned_address
+    class Writer:
+        def write(self, data): pass
+        async def drain(self): pass
+        def close(self): pass
+        async def wait_closed(self): pass
+    count=[0]
+    async def mocked_connect(**_options):
+        count[0]+=1
+        reader=asyncio.StreamReader()
+        reader.feed_data(b'HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/private\r\n\r\n')
+        reader.feed_eof()
+        return reader,Writer()
+    monkeypatch.setattr(asyncio,'open_connection',mocked_connect)
+    status=asyncio.run(status_from_pinned_address('http://example.com/status','example.com','93.184.215.14'))
+    assert status==302
+    assert count[0]==1

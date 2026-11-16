@@ -38,7 +38,7 @@ def health():
 
 
 from urllib.parse import urlparse
-import ipaddress,socket,httpx,time
+import ipaddress,socket,time,asyncio,ssl,re
 setup("""CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY,name TEXT NOT NULL,url TEXT NOT NULL,expected_status INTEGER NOT NULL DEFAULT 200);CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY,monitor_id INTEGER NOT NULL,status INTEGER,latency_ms INTEGER,ok INTEGER NOT NULL,checked_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(monitor_id) REFERENCES monitors(id));""")
 class Monitor(BaseModel):
     name:str
@@ -52,7 +52,7 @@ def valid_public_url(url: str, *, require_allowlist: bool = False):
     should also restrict network egress against DNS rebinding.
     """
     from urllib.parse import urlsplit
-    if not isinstance(url, str) or len(url) > 2048 or any(ord(ch) < 32 for ch in url):
+    if not isinstance(url, str) or len(url) > 2048 or any(ord(ch) <= 32 or ord(ch) > 126 for ch in url):
         raise HTTPException(422, 'Invalid monitoring URL')
     try:
         p = urlsplit(url)
@@ -80,9 +80,50 @@ def valid_public_url(url: str, *, require_allowlist: bool = False):
         infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except (socket.gaierror, OSError):
         raise HTTPException(422, 'Cannot resolve monitoring hostname')
-    if not infos or any(not ipaddress.ip_address(info[4][0]).is_global for info in infos):
+    addresses=sorted({info[4][0] for info in infos})
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise HTTPException(422, 'Private, reserved or local addresses are not allowed')
-    return host
+    # The caller MUST connect to this address, not resolve host a second time.
+    return host, addresses[0]
+
+async def status_from_pinned_address(url: str, hostname: str, ip: str) -> int:
+    """Make a minimal status-only HTTP request to a vetted numeric IP.
+
+    Resolving the hostname again inside an HTTP client would allow a
+    time-of-check/time-of-use DNS rebinding attack. TLS still authenticates
+    the original hostname using SNI and the system trust store.
+    Redirects are never followed.
+    """
+    from urllib.parse import urlsplit
+    parts=urlsplit(url)
+    port=parts.port or (443 if parts.scheme=='https' else 80)
+    target=(parts.path or '/')+('?' + parts.query if parts.query else '')
+    if not target.startswith('/') or any(ord(x)<=32 or ord(x)>126 for x in target):
+        raise OSError('Unsafe HTTP request target')
+    options={'host':ip,'port':port}
+    if parts.scheme=='https':
+        options.update({'ssl':ssl.create_default_context(),'server_hostname':hostname})
+    reader,writer=await asyncio.wait_for(asyncio.open_connection(**options),timeout=5)
+    try:
+        host_header=hostname+(f':{port}' if parts.port else '')
+        request=(f'GET {target} HTTP/1.1\\r\\n'
+                 f'Host: {host_header}\\r\\n'
+                 'Accept: */*\\r\\n'
+                 'User-Agent: UptimePilot/1.0\\r\\n'
+                 'Connection: close\\r\\n\\r\\n')
+        writer.write(request.encode('ascii'))
+        await asyncio.wait_for(writer.drain(),timeout=5)
+        line=await asyncio.wait_for(reader.readline(),timeout=5)
+        match=re.fullmatch(rb'HTTP/1\\.[01] ([1-5][0-9]{2})(?:[ \\t][^\\r\\n]*)?\\r?\\n',line)
+        if not match:
+            raise OSError('Invalid upstream HTTP status line')
+        return int(match.group(1))
+    finally:
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(),timeout=2)
+        except (OSError,TimeoutError,asyncio.TimeoutError):
+            pass
 
 @app.get('/api/items')
 def items():
@@ -97,12 +138,12 @@ def create_item(d:Monitor):
 async def check(id:int):
     with db() as c:m=c.execute('SELECT * FROM monitors WHERE id=?',(id,)).fetchone()
     if not m:raise HTTPException(404,'Monitor not found')
-    valid_public_url(m['url'],require_allowlist=True)
+    hostname, pinned_ip=valid_public_url(m['url'],require_allowlist=True)
     start=time.monotonic();status=None
     try:
-        async with httpx.AsyncClient(timeout=5,follow_redirects=False,trust_env=False) as client:
-            res=await client.get(m['url']);status=res.status_code
-    except httpx.RequestError:pass
+        status=await status_from_pinned_address(m['url'],hostname,pinned_ip)
+    except (OSError,TimeoutError,asyncio.TimeoutError,asyncio.IncompleteReadError,ValueError):
+        pass
     latency=round((time.monotonic()-start)*1000)
     ok=int(status==m['expected_status'])
     with db() as c:c.execute('INSERT INTO checks(monitor_id,status,latency_ms,ok) VALUES(?,?,?,?)',(id,status,latency,ok))

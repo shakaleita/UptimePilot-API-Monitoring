@@ -47,7 +47,11 @@ class Monitor(BaseModel):
 
 def valid_public_url(url):
     p=urlparse(url)
-    if p.scheme not in ('http','https') or not p.hostname or p.username or p.password:raise HTTPException(422,'Use a public HTTP(S) URL')
+    if p.scheme not in ('http','https') or not p.hostname or p.username or p.password or p.fragment:
+        raise HTTPException(422,'Use a public HTTP(S) URL')
+    try:
+        if p.port not in (None,80,443):raise HTTPException(422,'Only standard HTTP(S) ports are allowed')
+    except ValueError:raise HTTPException(422,'Invalid URL port')
     try:
         infos=socket.getaddrinfo(p.hostname,None)
         if not infos or any(not ipaddress.ip_address(info[4][0]).is_global for info in infos):raise HTTPException(422,'Private/network-local hosts are not allowed')
@@ -65,7 +69,7 @@ def create_item(d:Monitor):
 async def check(id:int):
     with db() as c:m=c.execute('SELECT * FROM monitors WHERE id=?',(id,)).fetchone()
     if not m:raise HTTPException(404,'Monitor not found')
-    valid_public_url(m['url'])
+    valid_public_url(m['url'],require_allowlist=True)
     start=time.monotonic();status=None
     try:
         async with httpx.AsyncClient(timeout=5,follow_redirects=False,trust_env=False) as client:
@@ -107,3 +111,16 @@ def monitor_history(monitor_id: int, limit: int = 50):
             raise HTTPException(404,'Monitor not found')
         return rows(con.execute('SELECT * FROM checks WHERE monitor_id=? ORDER BY id DESC LIMIT ?',(monitor_id,limit)))
 
+
+@app.get('/api/reliability')
+def reliability():
+    with db() as con:
+        return rows(con.execute("""SELECT m.id,m.name,COUNT(c.id) AS checks,
+            COALESCE(SUM(c.ok),0) AS successful,
+            ROUND(100.0*SUM(c.ok)/NULLIF(COUNT(c.id),0),2) AS uptime_percent,
+            ROUND(AVG(c.latency_ms),1) AS avg_latency_ms
+            FROM monitors m LEFT JOIN checks c ON c.monitor_id=m.id
+            GROUP BY m.id ORDER BY uptime_percent ASC,m.name"""))
+
+from security import install_auth
+install_auth(app,DB)

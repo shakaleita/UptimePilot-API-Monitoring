@@ -106,15 +106,15 @@ async def status_from_pinned_address(url: str, hostname: str, ip: str) -> int:
     reader,writer=await asyncio.wait_for(asyncio.open_connection(**options),timeout=5)
     try:
         host_header=hostname+(f':{port}' if parts.port else '')
-        request=(f'GET {target} HTTP/1.1\\r\\n'
-                 f'Host: {host_header}\\r\\n'
-                 'Accept: */*\\r\\n'
-                 'User-Agent: UptimePilot/1.0\\r\\n'
-                 'Connection: close\\r\\n\\r\\n')
+        request=(f'GET {target} HTTP/1.1\r\n'
+                 f'Host: {host_header}\r\n'
+                 'Accept: */*\r\n'
+                 'User-Agent: UptimePilot/1.0\r\n'
+                 'Connection: close\r\n\r\n')
         writer.write(request.encode('ascii'))
         await asyncio.wait_for(writer.drain(),timeout=5)
         line=await asyncio.wait_for(reader.readline(),timeout=5)
-        match=re.fullmatch(rb'HTTP/1\\.[01] ([1-5][0-9]{2})(?:[ \\t][^\\r\\n]*)?\\r?\\n',line)
+        match=re.fullmatch(rb'HTTP/1\.[01] ([1-5][0-9]{2})(?:[ \t][^\r\n]*)?\r?\n',line)
         if not match:
             raise OSError('Invalid upstream HTTP status line')
         return int(match.group(1))

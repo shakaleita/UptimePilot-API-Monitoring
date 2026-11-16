@@ -60,3 +60,40 @@ def test_v06_audit_record_and_cross_site_guard():
     assert client.get('/api/auth/audit',params={'limit':201}).status_code==422
     blocked=client.post('/api/__audit_probe_404',headers={'sec-fetch-site':'cross-site'})
     assert blocked.status_code==403
+
+
+def test_monitor_allowlist_enforced_before_network(monkeypatch):
+    from main import valid_public_url
+    from fastapi import HTTPException
+    import pytest
+    monkeypatch.delenv('ALLOWED_MONITOR_HOSTS', raising=False)
+    with pytest.raises(HTTPException) as error:
+        valid_public_url('https://example.com', require_allowlist=True)
+    assert error.value.status_code == 403
+    monkeypatch.setenv('ALLOWED_MONITOR_HOSTS','example.org')
+    with pytest.raises(HTTPException) as error:
+        valid_public_url('https://example.com', require_allowlist=True)
+    assert error.value.status_code == 403
+
+
+def test_monitor_rejects_local_hosts_and_bad_ports_without_network(monkeypatch):
+    from main import valid_public_url
+    from fastapi import HTTPException
+    import pytest
+    for url in ['http://localhost/', 'https://127.0.0.1/', 'http://169.254.169.254/',
+                'https://example.com:444/', 'file:///etc/passwd', 'https://[::1]/']:
+        with pytest.raises(HTTPException) as error:
+            valid_public_url(url)
+        assert error.value.status_code == 422
+
+
+def test_monitor_rejects_private_resolution(monkeypatch):
+    import socket
+    from main import valid_public_url
+    from fastapi import HTTPException
+    import pytest
+    monkeypatch.setenv('ALLOWED_MONITOR_HOSTS','example.com')
+    monkeypatch.setattr(socket,'getaddrinfo',lambda *args,**kwargs:[(socket.AF_INET,socket.SOCK_STREAM,6,'',('10.0.0.1',0))])
+    with pytest.raises(HTTPException) as error:
+        valid_public_url('https://example.com', require_allowlist=True)
+    assert error.value.status_code == 422
